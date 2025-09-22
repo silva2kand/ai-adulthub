@@ -1,0 +1,384 @@
+name: Security Scan & Compliance Check
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Run security scan daily at 2 AM UTC
+    - cron: '0 2 * * *'
+
+env:
+  NODE_VERSION: '18'
+  DOCKER_IMAGE_NAME: 'adult-video-aggregator'
+
+jobs:
+  dependency-scan:
+    name: Dependency Vulnerability Scan
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          
+      - name: Install dependencies
+        run: npm ci
+        
+      - name: Run Snyk to check for vulnerabilities
+        uses: snyk/actions/node@master
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          args: --severity-threshold=high --json
+          json: true
+          
+      - name: Upload Snyk results to GitHub Code Scanning
+        uses: github/codeql-action/upload-sarif@v2
+        if: always()
+        with:
+          sarif_file: snyk.sarif
+          
+      - name: Run npm audit
+        run: |
+          npm audit --audit-level=high --json > npm-audit.json || true
+          
+      - name: Upload npm audit results
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: npm-audit-results
+          path: npm-audit.json
+
+  sast-scan:
+    name: Static Application Security Testing
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Run CodeQL Analysis
+        uses: github/codeql-action/init@v2
+        with:
+          languages: javascript, typescript
+          
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@v2
+        
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v2
+        
+      - name: Run Semgrep
+        uses: returntocorp/semgrep-action@v1
+        with:
+          config: >-
+            p/security-audit
+            p/javascript
+            p/typescript
+            p/owasp-top-ten
+            p/docker
+          generateSarif: "1"
+          
+      - name: Upload Semgrep results
+        uses: github/codeql-action/upload-sarif@v2
+        if: always()
+        with:
+          sarif_file: semgrep.sarif
+
+  docker-security:
+    name: Docker Container Security Scan
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        
+      - name: Build Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: false
+          tags: ${{ env.DOCKER_IMAGE_NAME }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: '${{ env.DOCKER_IMAGE_NAME }}:${{ github.sha }}'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: 'CRITICAL,HIGH,MEDIUM'
+          
+      - name: Upload Trivy scan results to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v2
+        if: always()
+        with:
+          sarif_file: 'trivy-results.sarif'
+          
+      - name: Run Hadolint (Dockerfile linter)
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: Dockerfile
+          format: sarif
+          output-file: hadolint-results.sarif
+          
+      - name: Upload Hadolint results
+        uses: github/codeql-action/upload-sarif@v2
+        if: always()
+        with:
+          sarif_file: hadolint-results.sarif
+
+  secrets-scan:
+    name: Secrets Detection
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Fetch all history for all branches and tags
+          
+      - name: Run TruffleHog OSS
+        uses: trufflesecurity/trufflehog@main
+        with:
+          path: ./
+          base: main
+          head: HEAD
+          extra_args: --debug --only-verified
+          
+      - name: Run GitLeaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
+
+  infrastructure-scan:
+    name: Infrastructure as Code Security
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Run Checkov
+        id: checkov
+        uses: bridgecrewio/checkov-action@master
+        with:
+          directory: .
+          framework: dockerfile,github_actions,secrets
+          output_format: sarif
+          output_file_path: checkov-results.sarif
+          
+      - name: Upload Checkov results
+        uses: github/codeql-action/upload-sarif@v2
+        if: always()
+        with:
+          sarif_file: checkov-results.sarif
+          
+      - name: Run Terrascan
+        id: terrascan
+        uses: tenable/terrascan-action@main
+        with:
+          iac_type: 'docker'
+          iac_version: 'v1'
+          policy_type: 'all'
+          only_warn: true
+          sarif_upload: true
+
+  compliance-check:
+    name: Compliance & 2257 Validation
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          
+      - name: Install dependencies
+        run: npm ci
+        
+      - name: Run 2257 compliance checks
+        run: |
+          echo "Validating 2257 record keeping compliance..."
+          
+          # Check if required database schemas exist
+          if [ ! -f "migrations/001_2257_records.sql" ]; then
+            echo "ERROR: 2257 record keeping schema not found"
+            exit 1
+          fi
+          
+          # Check if performer record model exists
+          if [ ! -f "src/models/PerformerRecord.ts" ]; then
+            echo "ERROR: PerformerRecord model not found"
+            exit 1
+          fi
+          
+          # Validate schema structure
+          grep -q "performer_records" migrations/001_2257_records.sql || {
+            echo "ERROR: performer_records table not found in schema"
+            exit 1
+          }
+          
+          # Check for required fields
+          required_fields=("performer_name" "id_type" "id_number" "date_of_birth" "id_image_url")
+          for field in "${required_fields[@]}"; do
+            grep -q "$field" migrations/001_2257_records.sql || {
+              echo "ERROR: Required field $field not found in schema"
+              exit 1
+            }
+          done
+          
+          echo "✅ 2257 compliance validation passed"
+          
+      - name: Validate GDPR compliance
+        run: |
+          echo "Validating GDPR compliance..."
+          
+          # Check for user deletion functionality
+          grep -r "DELETE.*users" src/ || {
+            echo "ERROR: User deletion functionality not found"
+            exit 1
+          }
+          
+          # Check for data export functionality
+          grep -r "data.*export\|export.*data" src/ || {
+            echo "WARNING: Data export functionality not clearly implemented"
+          }
+          
+          echo "✅ GDPR compliance validation passed"
+
+  security-report:
+    name: Generate Security Report
+    needs: [dependency-scan, sast-scan, docker-security, secrets-scan, infrastructure-scan, compliance-check]
+    runs-on: ubuntu-latest
+    if: always()
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Download all artifacts
+        uses: actions/download-artifact@v3
+        
+      - name: Generate security summary
+        run: |
+          cat > security-report.md << 'EOF'
+          # Security Scan Report
+          
+          **Date:** $(date)
+          **Commit:** ${{ github.sha }}
+          **Branch:** ${{ github.ref_name }}
+          
+          ## Scan Results Summary
+          
+          | Scan Type | Status |
+          |-----------|--------|
+          | Dependency Scan | ${{ needs.dependency-scan.result }} |
+          | SAST Scan | ${{ needs.sast-scan.result }} |
+          | Docker Security | ${{ needs.docker-security.result }} |
+          | Secrets Detection | ${{ needs.secrets-scan.result }} |
+          | Infrastructure Scan | ${{ needs.infrastructure-scan.result }} |
+          | Compliance Check | ${{ needs.compliance-check.result }} |
+          
+          ## Actions Required
+          
+          EOF
+          
+          # Add recommendations based on failures
+          if [ "${{ needs.dependency-scan.result }}" = "failure" ]; then
+            echo "- 🔴 **Critical:** Fix dependency vulnerabilities" >> security-report.md
+          fi
+          
+          if [ "${{ needs.docker-security.result }}" = "failure" ]; then
+            echo "- 🔴 **Critical:** Resolve Docker security issues" >> security-report.md
+          fi
+          
+          if [ "${{ needs.secrets-scan.result }}" = "failure" ]; then
+            echo "- 🔴 **Critical:** Remove exposed secrets immediately" >> security-report.md
+          fi
+          
+          echo "Security report generated successfully"
+          
+      - name: Upload security report
+        uses: actions/upload-artifact@v3
+        with:
+          name: security-report
+          path: security-report.md
+          
+      - name: Comment on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const fs = require('fs');
+            const report = fs.readFileSync('security-report.md', 'utf8');
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `## 🔒 Security Scan Results\n\n${report}`
+            });
+
+  production-readiness:
+    name: Production Readiness Check
+    needs: [dependency-scan, sast-scan, docker-security, secrets-scan, infrastructure-scan, compliance-check]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && success()
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Validate production configuration
+        run: |
+          echo "Checking production readiness..."
+          
+          # Check for required environment variables documentation
+          if [ ! -f ".env.example" ]; then
+            echo "ERROR: .env.example file missing"
+            exit 1
+          fi
+          
+          # Check for backup scripts
+          if [ ! -f "scripts/backup.sh" ]; then
+            echo "ERROR: Backup script not found"
+            exit 1
+          fi
+          
+          # Check for monitoring configuration
+          if [ ! -f "docker-compose.yml" ] || ! grep -q "prometheus" docker-compose.yml; then
+            echo "WARNING: Monitoring stack not properly configured"
+          fi
+          
+          # Check for security middleware
+          if ! grep -r "botProtection\|rateLimit" src/; then
+            echo "ERROR: Security middleware not implemented"
+            exit 1
+          fi
+          
+          echo "✅ Production readiness validation passed"
+          
+      - name: Tag as production-ready
+        if: success()
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git tag -a "prod-ready-$(date +%Y%m%d-%H%M%S)" -m "Production ready build"
+          git push origin --tags
